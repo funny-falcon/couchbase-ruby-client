@@ -33,6 +33,7 @@ VALUE cb_mURI;
 VALUE em_m;
 
 /* Symbols */
+ID cb_sym__on_connect;
 ID cb_sym_add;
 ID cb_sym_append;
 ID cb_sym_assemble_hash;
@@ -43,6 +44,7 @@ ID cb_sym_cas;
 ID cb_sym_chunked;
 ID cb_sym_cluster;
 ID cb_sym_content_type;
+ID cb_sym_connect;
 ID cb_sym_create;
 ID cb_sym_decrement;
 ID cb_sym_default;
@@ -530,6 +532,7 @@ Init_couchbase_ext(void)
      */
     cb_cResult = rb_define_class_under(cb_mCouchbase, "Result", rb_cObject);
     rb_define_method(cb_cResult, "inspect", cb_result_inspect, 0);
+    rb_define_method(cb_cResult, "to_s", cb_result_inspect, 0);
     rb_define_method(cb_cResult, "success?", cb_result_success_p, 0);
     /* Document-method: operation
      *
@@ -560,6 +563,7 @@ Init_couchbase_ext(void)
      * @return [String]
      */
     rb_define_attr(cb_cResult, "value", 1, 0);
+    rb_define_alias(cb_cResult, "bucket", "value");
     cb_id_iv_value = rb_intern("@value");
     /* Document-method: cas
      *
@@ -862,6 +866,44 @@ Init_couchbase_ext(void)
     rb_define_method(cb_cBucket, "on_error", cb_bucket_on_error_get, 0);
     rb_define_method(cb_cBucket, "on_error=", cb_bucket_on_error_set, 1);
 
+    /*
+     * Document-method: on_connect
+     * Connection callback for asynchronous mode using EventMachine engine
+     *
+     * @since 1.2.1
+     *
+     * This callback is called when bucket created within EventMachine engine
+     * established connection or connection error were discovered.
+     *
+     * After connection is established, callback is cleared
+     *
+     * @yieldparam [Exception] exc Exception if connection is not established, nil otherwise
+     * @yieldparam [Bucket] bucket Bucket itself
+     *
+     * @example
+     *   EM.run do
+     *     pull = Pool.new
+     *     connection = Couchbase.new(:engine => :eventmachine, :async => true)
+     *     connection.on_connect do |result|
+     *       unless result.success?
+     *         $stderr.puts "Could not connect to CouchBase #{result.error}"
+     *       else
+     *         pull.add result.bucket
+     *       end
+     *     end
+     *   end
+     *
+     * @example
+     *   EM.run do
+     *     pool = Pool.new
+     *     connection = Couchbase.new(:engine => :eventmachine, :async => true)
+     *     connection.on_connect = pool.method(:couchbase_connect_callback)
+     *   end
+     * @return [Proc] the effective callback */
+    rb_define_method(cb_cBucket, "on_connect", cb_bucket_on_connect_get, 0);
+    rb_define_method(cb_cBucket, "on_connect=", cb_bucket_on_connect_set, 1);
+    rb_define_method(cb_cBucket, "_on_connect", cb_bucket__on_connect, 0);
+
     /* Document-method: url
      *
      * The config url for this connection.
@@ -1042,6 +1084,7 @@ Init_couchbase_ext(void)
     cb_id_user = rb_intern("user");
     cb_id_verify_observe_options = rb_intern("verify_observe_options");
 
+    cb_sym__on_connect = ID2SYM(rb_intern("_on_connect"));
     cb_sym_add = ID2SYM(rb_intern("add"));
     cb_sym_append = ID2SYM(rb_intern("append"));
     cb_sym_assemble_hash = ID2SYM(rb_intern("assemble_hash"));
@@ -1052,6 +1095,7 @@ Init_couchbase_ext(void)
     cb_sym_chunked = ID2SYM(rb_intern("chunked"));
     cb_sym_cluster = ID2SYM(rb_intern("cluster"));
     cb_sym_content_type = ID2SYM(rb_intern("content_type"));
+    cb_sym_connect = ID2SYM(rb_intern("connect"));
     cb_sym_create = ID2SYM(rb_intern("create"));
     cb_sym_decrement = ID2SYM(rb_intern("decrement"));
     cb_sym_default = ID2SYM(rb_intern("default"));

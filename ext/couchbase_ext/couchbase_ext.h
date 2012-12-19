@@ -110,7 +110,9 @@ struct cb_bucket_st
     VALUE node_list;
     st_table *object_space;
     char  destroying;
+    char  async_connected;
     char  async_disconnect_hook_set;
+    VALUE on_connect_proc;  /* callback on successful connection or connection error */
     VALUE self;             /* the pointer to bucket representation in ruby land */
 };
 
@@ -171,6 +173,7 @@ extern VALUE cb_mURI;
 extern VALUE em_m;
 
 /* Symbols */
+extern ID cb_sym__on_connect;
 extern ID cb_sym_add;
 extern ID cb_sym_append;
 extern ID cb_sym_assemble_hash;
@@ -181,6 +184,7 @@ extern ID cb_sym_cas;
 extern ID cb_sym_chunked;
 extern ID cb_sym_cluster;
 extern ID cb_sym_content_type;
+extern ID cb_sym_connect;
 extern ID cb_sym_create;
 extern ID cb_sym_decrement;
 extern ID cb_sym_default;
@@ -388,6 +392,9 @@ VALUE cb_bucket_default_format_get(VALUE self);
 VALUE cb_bucket_default_format_set(VALUE self, VALUE val);
 VALUE cb_bucket_on_error_set(VALUE self, VALUE val);
 VALUE cb_bucket_on_error_get(VALUE self);
+VALUE cb_bucket_on_connect_set(VALUE self, VALUE val);
+VALUE cb_bucket_on_connect_get(VALUE self);
+VALUE cb_bucket__on_connect(VALUE self);
 VALUE cb_bucket_timeout_get(VALUE self);
 VALUE cb_bucket_timeout_set(VALUE self, VALUE val);
 VALUE cb_bucket_key_prefix_get(VALUE self);
