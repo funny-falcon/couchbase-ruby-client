@@ -18,12 +18,50 @@
 #include "couchbase_ext.h"
 
     static void
+cb_bucket_schedule_on_connect(struct cb_bucket_st *bucket)
+{
+    VALUE _on_connect = rb_obj_method(bucket->self, cb_sym__on_connect);
+    rb_funcall_1(em_m, cb_id_next_tick, _on_connect);
+}
+
+    VALUE
+cb_bucket__on_connect(VALUE self)
+{
+    struct cb_bucket_st *bucket = DATA_PTR(self);
+    VALUE exception = bucket->exception;
+    VALUE on_connect_proc = bucket->on_connect_proc;
+    VALUE res = rb_class_new_instance(0, NULL, cb_cResult);
+    if (RTEST(exception)) {
+        cb_bucket_disconnect(self);
+        bucket->exception = Qnil;
+    }
+    rb_ivar_set(res, cb_id_iv_error, exception);
+    rb_ivar_set(res, cb_id_iv_operation, cb_sym_connect);
+    rb_ivar_set(res, cb_id_iv_value, self);
+    return rb_funcall_1(on_connect_proc, cb_id_call, res);
+}
+
+    static void
 error_callback(lcb_t handle, lcb_error_t error, const char *errinfo)
 {
     struct cb_bucket_st *bucket = (struct cb_bucket_st *)lcb_get_cookie(handle);
 
     lcb_breakout(handle);
     bucket->exception = cb_check_error(error, errinfo, Qnil);
+    if (!bucket->async_connected) {
+        cb_bucket_schedule_on_connect(bucket);
+    }
+}
+
+    static void
+configuration_callback(lcb_t handle, lcb_configuration_t config)
+{
+    struct cb_bucket_st *bucket = (struct cb_bucket_st *)lcb_get_cookie(handle);
+
+    if (config == LCB_CONFIGURATION_NEW && bucket->engine == cb_sym_eventmachine) {
+        bucket->async_connected = 1;
+        cb_bucket_schedule_on_connect(bucket);
+    }
 }
 
     void
@@ -63,6 +101,7 @@ cb_bucket_mark(void *ptr)
         rb_gc_mark(bucket->password);
         rb_gc_mark(bucket->exception);
         rb_gc_mark(bucket->on_error_proc);
+        rb_gc_mark(bucket->on_connect_proc);
         rb_gc_mark(bucket->key_prefix_val);
         st_foreach(bucket->object_space, cb_bucket_mark_object_i, (st_data_t)bucket);
     }
@@ -231,6 +270,17 @@ do_scan_connection_options(struct cb_bucket_st *bucket, int argc, VALUE *argv)
                     rb_raise(rb_eArgError, "Couchbase: unknown engine %s", RSTRING_PTR(ins));
                 }
             }
+            arg = rb_hash_aref(opts, cb_sym_async);
+            if (RTEST(arg)) {
+                if (bucket->engine == cb_sym_eventmachine) {
+                    bucket->async = 1;
+                }
+                else {
+                    rb_raise(rb_eArgError, "Couchbase: multithreaded engine doesn't support "
+                                           "initially asynchronous connections. "
+                                           "Consider using EventMachine");
+                }
+            }
         } else {
             opts = Qnil;
         }
@@ -266,6 +316,7 @@ do_connect(struct cb_bucket_st *bucket)
     if (bucket->handle) {
         lcb_destroy(bucket->handle);
         lcb_destroy_io_ops(bucket->io);
+        bucket->async_connected = 0;
         bucket->handle = NULL;
         bucket->io = NULL;
     }
@@ -345,13 +396,19 @@ do_connect(struct cb_bucket_st *bucket)
         bucket->async_disconnect_hook_set = 1;
         rb_block_call(em_m, rb_intern("add_shutdown_hook"), 0, NULL, em_disconnect_block, bucket->self);
     }
-    lcb_wait(bucket->handle);
-    if (bucket->exception != Qnil) {
-        lcb_destroy(bucket->handle);
-        lcb_destroy_io_ops(bucket->io);
-        bucket->handle = NULL;
-        bucket->io = NULL;
-        rb_exc_raise(bucket->exception);
+    if (!bucket->async) {
+        bucket->async_connected = 1;
+        lcb_wait(bucket->handle);
+        if (bucket->exception != Qnil) {
+            lcb_destroy(bucket->handle);
+            lcb_destroy_io_ops(bucket->io);
+            bucket->handle = NULL;
+            bucket->io = NULL;
+            rb_exc_raise(bucket->exception);
+        }
+    }
+    else {
+        (void)lcb_set_configuration_callback(bucket->handle, configuration_callback);
     }
 }
 
@@ -483,6 +540,8 @@ cb_bucket_init(int argc, VALUE *argv, VALUE self)
     bucket->node_list = Qnil;
     bucket->object_space = st_init_numtable();
     bucket->destroying = 0;
+    bucket->async_connected = 0;
+    bucket->on_connect_proc = Qnil;
     bucket->async_disconnect_hook_set = 0;
 
     do_scan_connection_options(bucket, argc, argv);
@@ -534,9 +593,13 @@ cb_bucket_init_copy(VALUE copy, VALUE orig)
     copy_b->environment = orig_b->environment;
     copy_b->timeout = orig_b->timeout;
     copy_b->exception = Qnil;
+    copy_b->async_connected = 0;
     copy_b->async_disconnect_hook_set = 0;
     if (orig_b->on_error_proc != Qnil) {
         copy_b->on_error_proc = rb_funcall(orig_b->on_error_proc, cb_id_dup, 0);
+    }
+    if (orig_b->on_connect_proc != Qnil) {
+        copy_b->on_connect_proc = rb_funcall(orig_b->on_connect_proc, cb_id_dup, 0);
     }
     copy_b->key_prefix_val = orig_b->key_prefix_val;
     copy_b->object_space = st_init_numtable();
@@ -713,6 +776,39 @@ cb_bucket_on_error_get(VALUE self)
         return cb_bucket_on_error_set(self, rb_block_proc());
     } else {
         return bucket->on_error_proc;
+    }
+}
+
+    VALUE
+cb_bucket_on_connect_set(VALUE self, VALUE val)
+{
+    struct cb_bucket_st *bucket = DATA_PTR(self);
+
+    if (bucket->engine == cb_sym_multithreaded) {
+        rb_raise(rb_eArgError, "Could not set on_connect callback for :multithreaded engine. "
+                               "Consider using :eventmachine engine.");
+    }
+    if (rb_respond_to(val, cb_id_call)) {
+        bucket->on_connect_proc = val;
+        if (bucket->async_connected) {
+            cb_bucket_schedule_on_connect(bucket);
+        }
+    } else {
+        bucket->on_connect_proc = Qnil;
+    }
+
+    return bucket->on_connect_proc;
+}
+
+    VALUE
+cb_bucket_on_connect_get(VALUE self)
+{
+    struct cb_bucket_st *bucket = DATA_PTR(self);
+
+    if (rb_block_given_p()) {
+        return cb_bucket_on_connect_set(self, rb_block_proc());
+    } else {
+        return bucket->on_connect_proc;
     }
 }
 
@@ -1175,6 +1271,7 @@ cb_bucket_disconnect(VALUE self)
     if (bucket->handle) {
         lcb_destroy(bucket->handle);
         lcb_destroy_io_ops(bucket->io);
+        bucket->async_connected = 0;
         bucket->handle = NULL;
         bucket->io = NULL;
         return Qtrue;
@@ -1183,5 +1280,3 @@ cb_bucket_disconnect(VALUE self)
         return Qfalse;
     }
 }
-
-
