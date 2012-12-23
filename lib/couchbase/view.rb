@@ -64,62 +64,78 @@ module Couchbase
       attr_accessor :total_rows
     end
 
-    class Synchronizer # :nodoc:
+    class AsyncHelper # :nodoc:
       include Constants
       EMPTY = []
-      def initialize(wrapper_class, bucket, &block)
+
+      def initialize(wrapper_class, bucket, include_docs, quiet, block)
         @wrapper_class = wrapper_class
         @bucket = bucket
+        @block = block
+        @quiet = quiet
+        @include_docs = include_docs
         @queue = []
         @first = @shift = 0
-        @block = block
         @completed = false
       end
 
-      def <<(obj)
-        @queue << obj
+      # Register object in the emitter.
+      def push(obj)
+        if @include_docs
+          @queue << obj
+          @bucket.get(obj[S_ID], :extended => true, :quiet => @quiet) do |res|
+            obj[S_DOC] = {
+              S_VALUE => res.value,
+              S_META => {
+                S_ID => obj[S_ID],
+                S_FLAGS => res.flags,
+                S_CAS => res.cas
+              }
+            }
+            check_for_ready_documents
+          end
+        else
+          old_obj = @queue.shift
+          @queue << obj
+          block_call(old_obj) if old_obj
+        end
       end
 
-      def check!
+      def complete!
+        if @include_docs
+          @completed = true
+        elsif !@queue.empty?
+          obj = @queue.shift
+          obj[S_IS_LAST] = true
+          block_call obj
+        end
+      end
+
+      private
+
+      def block_call(obj)
+        @block.call @wrapper_class.wrap(@bucket, obj)
+      end
+
+      def check_for_ready_documents
         shift = @shift
-        while @first < @queue.size + shift
-          obj = @queue[@first - shift]
+        queue = @queue
+        while @first < queue.size + shift
+          obj = queue[@first - shift]
           break unless obj[S_DOC]
-          @queue[@first - shift] = nil
+          queue[@first - shift] = nil
           @first += 1
-          if @completed && @first == @queue.size + shift
+          if @completed && @first == queue.size + shift
             obj[S_IS_LAST] = true
           end
-          @block.call @wrapper_class.wrap(@bucket, obj)
+          block_call obj
         end
-        if @first - shift > @queue.size / 2
-          @queue[0, @first - shift] = EMPTY
+        if @first - shift > queue.size / 2
+          queue[0, @first - shift] = EMPTY
           @shift = @first
         end
       end
 
-      def completed!
-        @completed = true
-      end
-    end
-
-    class Proxy # :nodoc:
-      def initialize(wrapper_class, bucket, array)
-        @wrapper_class = wrapper_class
-        @bucket = bucket
-        @array = array
-      end
-
-      def <<(obj)
-        @array << @wrapper_class.wrap(@bucket, obj)
-      end
-
-      def check!
-      end
-
-      def completed!
-        @array.last.instance_variable_set(:@last, true)
-      end
     end
 
     attr_reader :params
@@ -172,10 +188,17 @@ module Couchbase
     #
     def each(params = {})
       return enum_for(:each, params) unless block_given?
-      if @bucket.async?
-        raise ArgumentError, "CouchBase::View#each should not be used in asynchronous mode"
-      end
       fetch(params) {|doc| yield(doc)}
+    end
+
+    def first(params = {})
+      params = params.merge(:limit => 1)
+      fetch(params).first
+    end
+
+    def take(n, params = {})
+      params = params.merge(:limit => n)
+      fetch(params)
     end
 
     # Registers callback function for handling error objects in view
@@ -325,11 +348,7 @@ module Couchbase
     #   doc.recent_posts_with_comments(:start_key => [post_id, 0],
     #                                  :end_key => [post_id, 1],
     #                                  :include_docs => true)
-    def fetch(params = {})
-      if @bucket.async? && !block_given?
-        raise ArgumentError, "Could not call View#fetch without block on asynchronous connection"
-      end
-
+    def fetch(params = {}, &block)
       params = @params.merge(params)
       include_docs = params.delete(:include_docs)
       quiet = params.delete(:quiet){ true }
@@ -342,32 +361,96 @@ module Couchbase
       path = Utils.build_query(@endpoint, params)
       request = @bucket.make_http_request(path, options)
 
-      filter = ["/rows/", "/errors/"]
-      filter << "/total_rows" unless block_given?
-      parser = YAJI::Parser.new(:filter => filter, :with_path => true)
-
-      if block_given?
-        if include_docs
-          sync = Synchronizer.new(@wrapper_class, @bucket){|doc| yield doc}
-        end
+      if @bucket.async? || !block
+        fetch_async(request, include_docs, quiet, block)
       else
+        fetch_sync(request, include_docs, quiet, block)
+      end
+    end
+
+
+    # Returns a string containing a human-readable representation of the {View}
+    #
+    # @return [String]
+    def inspect
+      %(#<#{self.class.name}:#{self.object_id} @endpoint=#{@endpoint.inspect} @params=#{@params.inspect}>)
+    end
+
+    private
+
+    def send_error(*args)
+      if @on_error
+        @on_error.call(*args.take(2))
+      else
+        raise Error::View.new(*args)
+      end
+    end
+
+    def fetch_async(request, include_docs, quiet, block)
+      filter = ["/rows/", "/errors/"]
+      parser = YAJI::Parser.new(:filter => filter, :with_path => true)
+      unless block
         docs = ArrayWithTotalRows.new
-        if include_docs
-          sync = Proxy.new(@wrapper_class, @bucket, docs)
+        block = docs.method(:<<)
+        filter << '/total_rows'
+      else
+        docs = nil
+      end
+      helper = AsyncHelper.new(@wrapper_class, @bucket, include_docs, quiet, block)
+
+      async = @bucket.async?
+      error = nil
+
+      request.on_body do |chunk|
+        if chunk.success?
+          parser << chunk.value if chunk.value
+          helper.complete! if chunk.completed?
+        else
+          if async
+            send_error("http_error", chunk.error)
+          else
+            error = ["http_error", chunk.error, nil]
+          end
         end
       end
 
-      request.on_body do |chunk|
-        if chunk.error
-          if @on_error
-            @on_error.call("http_error", chunk.error)
+      parser.on_object do |path, obj|
+        case path
+        when "/errors/"
+          from, reason = obj["from"], obj["reason"]
+          if async
+            send_error(from, reason)
           else
-            raise Error::View.new("http_error", chunk.error, nil)
+            error = [from, reason]
           end
+        when "/total_rows"
+          docs.total_rows = obj
         else
-          parser << chunk.value if chunk.value
-          sync.completed! if include_docs && chunk.completed?
+          helper.push(obj)
         end
+      end
+
+      if async
+        request.perform
+        nil
+      else
+        @bucket.run { request.perform }
+        send_error(*error)  if error
+        docs
+      end
+    end
+
+    def fetch_sync(request, include_docs, quiet, block)
+      res = []
+      filter = ["/rows/", "/errors/"]
+      filter << "/total_rows" unless block
+      parser = YAJI::Parser.new(:filter => filter, :with_path => true)
+      docs = block ? nil : ArrayWithTotalRows.new
+      last_chunk = nil
+
+      request.on_body do |chunk|
+        last_chunk = chunk
+        res << chunk.value  if chunk.success?
       end
 
       parser.on_object do |path, obj|
@@ -377,47 +460,36 @@ module Couchbase
           docs.total_rows = obj
         when "/errors/"
           from, reason = obj["from"], obj["reason"]
-          if @on_error
-            @on_error.call(from, reason)
-          else
-            raise Error::View.new(from, reason)
-          end
+          send_error(from, reason)
         else
           if include_docs
-            sync << obj
-            @bucket.get(obj[S_ID], :extended => true, :quiet => quiet) do |res|
-              obj[S_DOC] = {
-                S_VALUE => res.value,
-                S_META => {
-                  S_ID => obj[S_ID],
-                  S_FLAGS => res.flags,
-                  S_CAS => res.cas
-                }
+            val, flags, cas = @bucket.get(obj[S_ID], :extended => true, :quiet => quiet)
+            obj[S_DOC] = {
+              S_VALUE => val,
+              S_META => {
+                S_ID => obj[S_ID],
+                S_FLAGS => flags,
+                S_CAS => cas
               }
-              sync.check!
-            end
-          else
-            doc = @wrapper_class.wrap(@bucket, obj)
-            block_given? ? (yield doc) : docs << doc
+            }
           end
+          doc = @wrapper_class.wrap(@bucket, obj)
+          block ? block.call(doc) : docs << doc
         end
       end
 
-      if @bucket.async?
-        request.perform
+      request.continue
+
+      if last_chunk.success?
+        while value = res.shift
+          parser << value
+        end
       else
-        @bucket.run { request.perform }
+        send_error("http_error", last_chunk.error, nil)
       end
+
       # return nil for call with block
-      block_given? ? nil : docs
-    end
-
-
-    # Returns a string containing a human-readable representation of the {View}
-    #
-    # @return [String]
-    def inspect
-      %(#<#{self.class.name}:#{self.object_id} @endpoint=#{@endpoint.inspect} @params=#{@params.inspect}>)
+      docs
     end
   end
 end
