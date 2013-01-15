@@ -54,6 +54,9 @@ extern hrtime_t gethrtime(void);
 #ifndef HAVE_RB_HASH_LOOKUP2
 VALUE rb_hash_lookup2(VALUE, VALUE, VALUE);
 #endif
+#ifndef HAVE_RB_BLOCK_CALL
+VALUE rb_block_call(VALUE obj, ID meth, int argc, VALUE *argv, VALUE (*block)(), VALUE data2);
+#endif
 #ifndef HAVE_TYPE_ST_INDEX_T
 typedef st_data_t st_index_t;
 #endif
@@ -106,7 +109,8 @@ struct cb_bucket_st
     VALUE key_prefix_val;
     VALUE node_list;
     st_table *object_space;
-    char destroying;
+    char  destroying;
+    char  async_disconnect_hook_set;
     VALUE self;             /* the pointer to bucket representation in ruby land */
 };
 
@@ -164,11 +168,13 @@ extern VALUE cb_mError;
 extern VALUE cb_mMarshal;
 extern VALUE cb_mMultiJson;
 extern VALUE cb_mURI;
+extern VALUE em_m;
 
 /* Symbols */
 extern ID cb_sym_add;
 extern ID cb_sym_append;
 extern ID cb_sym_assemble_hash;
+extern ID cb_sym_async;
 extern ID cb_sym_body;
 extern ID cb_sym_bucket;
 extern ID cb_sym_cas;
@@ -189,6 +195,8 @@ extern ID cb_sym_development;
 extern ID cb_sym_document;
 extern ID cb_sym_engine;
 extern ID cb_sym_environment;
+extern ID cb_sym_engine;
+extern ID cb_sym_eventmachine;
 extern ID cb_sym_extended;
 extern ID cb_sym_flags;
 extern ID cb_sym_format;
@@ -205,6 +213,7 @@ extern ID cb_sym_lock;
 extern ID cb_sym_management;
 extern ID cb_sym_marshal;
 extern ID cb_sym_method;
+extern ID cb_sym_multithreaded;
 extern ID cb_sym_node_list;
 extern ID cb_sym_not_found;
 extern ID cb_sym_num_replicas;
@@ -258,6 +267,7 @@ extern ID cb_id_iv_time_to_replicate;
 extern ID cb_id_iv_value;
 extern ID cb_id_load;
 extern ID cb_id_match;
+extern ID cb_id_next_tick;
 extern ID cb_id_observe_and_wait;
 extern ID cb_id_parse;
 extern ID cb_id_parse_body_bang;
@@ -560,7 +570,38 @@ struct cb_params_st
 void cb_params_destroy(struct cb_params_st *params);
 void cb_params_build(struct cb_params_st *params);
 
+/* common plugin functions */
+lcb_ssize_t cb_io_recv(struct lcb_io_opt_st *iops, lcb_socket_t sock, void *buffer, lcb_size_t len, int flags);
+lcb_ssize_t cb_io_recvv(struct lcb_io_opt_st *iops, lcb_socket_t sock, struct lcb_iovec_st *iov, lcb_size_t niov);
+lcb_ssize_t cb_io_send(struct lcb_io_opt_st *iops, lcb_socket_t sock, const void *msg, lcb_size_t len, int flags);
+lcb_ssize_t cb_io_sendv(struct lcb_io_opt_st *iops, lcb_socket_t sock, struct lcb_iovec_st *iov, lcb_size_t niov);
+lcb_socket_t cb_io_socket(struct lcb_io_opt_st *iops, int domain, int type, int protocol);
+void cb_io_close(struct lcb_io_opt_st *iops, lcb_socket_t sock);
+int cb_io_connect(struct lcb_io_opt_st *iops, lcb_socket_t sock, const struct sockaddr *name, unsigned int namelen);
+
+/* plugin init functions */
 LIBCOUCHBASE_API
 lcb_error_t cb_create_ruby_mt_io_opts(int version, lcb_io_opt_t *io, void *arg);
+
+/* shortcut functions */
+    static inline VALUE
+rb_funcall_0(VALUE self, ID method)
+{
+    return rb_funcall2(self, method, 0, NULL);
+}
+
+    static inline VALUE
+rb_funcall_1(VALUE self, ID method, VALUE arg)
+{
+    return rb_funcall2(self, method, 1, &arg);
+}
+
+    static inline VALUE
+rb_funcall_2(VALUE self, ID method, VALUE arg1, VALUE arg2)
+{
+    VALUE args[2] = {arg1, arg2};
+    return rb_funcall2(self, method, 2, args);
+}
+
 #endif
 
