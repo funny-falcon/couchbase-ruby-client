@@ -84,6 +84,7 @@ module Couchbase
       def push(obj)
         if @include_docs
           @queue << obj
+          sz = @queue.size + @shift
           @bucket.get(obj[S_ID], :extended => true, :quiet => @quiet) do |res|
             obj[S_DOC] = {
               S_VALUE => res.value,
@@ -105,6 +106,7 @@ module Couchbase
       def complete!
         if @include_docs
           @completed = true
+          check_for_ready_documents
         elsif !@queue.empty?
           obj = @queue.shift
           obj[S_IS_LAST] = true
@@ -121,7 +123,8 @@ module Couchbase
       def check_for_ready_documents
         shift = @shift
         queue = @queue
-        while @first < queue.size + shift
+        save_last = @completed ? 0 : 1
+        while @first < queue.size + shift - save_last
           obj = queue[@first - shift]
           break unless obj[S_DOC]
           queue[@first - shift] = nil
@@ -397,7 +400,7 @@ module Couchbase
       request.on_body do |chunk|
         if chunk.success?
           parser << chunk.value if chunk.value
-          helper.complete! if chunk.completed?
+          helper.complete!  if chunk.completed?
         else
           send_error("http_error", chunk.error)
         end
