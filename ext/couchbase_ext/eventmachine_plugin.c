@@ -78,6 +78,17 @@ rb_em_event_free(void *p)
     }
 }
 
+    static void
+rb_em_event_run_callback(rb_em_event *ev, short flags)
+{
+    if (ev->loop->fiber) {
+        ev->current_flags = flags;
+        rb_fiber_resume(ev->loop->fiber, 1, &ev->self);
+    } else {
+        ev->handler(ev->socket, flags, ev->cb_data);
+    }
+}
+
     static VALUE
 rb_em_event_call(VALUE self)
 {
@@ -85,10 +96,9 @@ rb_em_event_call(VALUE self)
     Data_Get_Struct(self, rb_em_event, ev);
 
     ev->holder = 0;
-    ev->current_flags = 0;
+    rb_em_event_run_callback(ev, 0);
 
-    rb_fiber_resume(ev->loop->fiber, 1, &ev->self);
-    if (!ev->canceled) {
+    if (!ev->canceled && !ev->holder) {
         ev->holder = rb_funcall_2(em_m, cb_id_add_timer, rb_float_new((double)ev->usec / 1.0e6), self);
     }
 
@@ -127,8 +137,7 @@ rb_em_socket_notify_readable(VALUE self)
 
     if (RTEST(event)) {
         Data_Get_Struct(event, rb_em_event, ev);
-        ev->current_flags = LCB_READ_EVENT;
-        rb_fiber_resume(ev->loop->fiber, 1, &ev->self);
+        rb_em_event_run_callback(ev, LCB_READ_EVENT);
     }
     else {
         rb_funcall_0(self, cb_id_detach);
@@ -145,8 +154,7 @@ rb_em_socket_notify_writable(VALUE self)
 
     if (RTEST(event)) {
         Data_Get_Struct(event, rb_em_event, ev);
-        ev->current_flags = LCB_WRITE_EVENT;
-        rb_fiber_resume(ev->loop->fiber, 1, &ev->self);
+        rb_em_event_run_callback(ev, LCB_WRITE_EVENT);
     }
     else {
         rb_funcall_0(self, cb_id_detach);
